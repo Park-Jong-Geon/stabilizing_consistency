@@ -24,8 +24,8 @@ train:
   # learning_rate: 1.0e-4
   head_learning_rate: 1.0e-4
   torso_learning_rate: 1.0e-4
-  total_batch_size: 1024
-  batch_size_per_rounds: 1024 # The option for gradient accumulation, which is used for large batch size training.
-  total_step: 400000
+  total_batch_size: 512
+  batch_size_per_rounds: 512 # The option for gradient accumulation, which is used for large batch size training.
+  total_step: 600000
   optimizer:
     type: "radam"

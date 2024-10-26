@@ -81,7 +81,8 @@ class UnifyingFramework():
 
     def train(self):
         # TODO: The connection_denoiser_type is only used in CM training. need to be fixed.
-        datasets = common_utils.load_dataset_from_tfds(self.config)
+        # datasets = common_utils.load_dataset_from_tfds(self.config)
+        datasets = common_utils.load_custom_dataset(self.config)
         datasets_bar = tqdm(datasets, total=self.total_step, initial=self.step)
         in_process_dir = self.config.exp.in_process_dir
         in_process_model_dir_name = 'diffusion'
@@ -95,12 +96,14 @@ class UnifyingFramework():
 
         num_used_dataset = 0
 
-        for x, _ in datasets_bar:
+        # for x, _ in datasets_bar:
+        for x in datasets_bar:
+            # self.framework.fit(x, step=self.step)
             training_log = self.framework.fit(x, step=self.step)
             log.update(training_log)
 
             if self.step % self.config["sampling_step"] == 0:
-                batch_data = x[0, 0, :8] # (device_idx, n_jitted_steps, batch_size)
+                batch_data = x[0, 0, :8, 0] # (device_idx, n_jitted_steps, batch_size)
 
                 # Change of the sample quality is tracked to know how much the CM model is corrupted.
                 # Sample generated image for EDM

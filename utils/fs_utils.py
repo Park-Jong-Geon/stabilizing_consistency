@@ -226,7 +226,7 @@ class FSUtils():
         f.savefig(save_filename)
         plt.close()
         return save_filename
-    
+
     def save_images_to_dir(self, images, save_path_dir=None, starting_pos=0):
         current_sampling = 0
         if save_path_dir is None:
@@ -240,6 +240,26 @@ class FSUtils():
             sample_path = os.path.join(save_path_dir, f"{starting_pos + current_sampling}.png")
             im.save(sample_path)
             current_sampling += 1
+        return current_sampling
+
+    def save_noise_to_dir(self, images, save_path_dir=None, starting_pos=0):
+        current_sampling = 0
+        if save_path_dir is None:
+            save_path_dir = f'{self.config.exp.sampling_dir}_noise'
+        images = np.array(images)
+        for image in images:
+            sample_path = os.path.join(save_path_dir, f"{starting_pos + current_sampling}.npy")
+            np.save(sample_path, image)
+            current_sampling += 1
+        # images = common_utils.unnormalize_minus_one_to_one(images)
+        # images = np.clip(images, 0, 1)
+        # images = images * 255
+        # images = np.array(images).astype(np.uint8)
+        # for image in images:
+        #     im = Image.fromarray(image)
+        #     sample_path = os.path.join(save_path_dir, f"{starting_pos + current_sampling}.png")
+        #     im.save(sample_path)
+        #     current_sampling += 1
         return current_sampling
     
     def delete_images_from_dir(self, save_path_dir=None, starting_pos=50000):

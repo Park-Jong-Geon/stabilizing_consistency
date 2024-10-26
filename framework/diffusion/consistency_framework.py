@@ -19,6 +19,10 @@ from functools import partial
 from typing import Any
 
 # from clu import parameter_overview
+import blobfile
+import numpy as np
+
+import jaxopt
 
 class CMFramework(DefaultModel):
     def __init__(self, config: DictConfig, rand_key, fs_obj: FSUtils, wandblog: WandBLog):
@@ -101,6 +105,10 @@ class CMFramework(DefaultModel):
 
         # Define loss functions
         self.perceptual_loss = lpips_jax.LPIPSEvaluator(net='vgg16', replicate=False)
+        
+        self.total_num = 5000
+        self.current_num = 0
+        self.fs_utils = FSUtils(config)
 
 
         def edm_sigma_sampling_fn(rng_key, y):
@@ -159,13 +167,16 @@ class CMFramework(DefaultModel):
             target = jax.image.resize(target, output_shape, "bilinear")
             lpips_loss = jnp.mean(loss_weight * self.perceptual_loss(pred, target))
             return lpips_loss
+        self.lpips_loss_fn = lpips_loss_fn
         
         def pseudo_huber_loss_fn(pred, target, loss_weight=1):
             data_dim = pred.shape[1:]
             c = diffusion_framework.get("pseudo_huber_loss_c", 0.00054 * jnp.sqrt(data_dim[0] * data_dim[1] * data_dim[2]))
-            pseudo_huber = jnp.sqrt((pred - target) ** 2 + c ** 2) - c
+            # pseudo_huber = jnp.sqrt((pred - target) ** 2 + c ** 2) - c
+            pseudo_huber = jnp.sqrt((pred - target) ** 2 + c ** 2)
             pseudo_huber_loss = jnp.mean(loss_weight * pseudo_huber)
             return pseudo_huber_loss
+        self.pseudo_huber_loss_fn = pseudo_huber_loss_fn
         
         def get_loss(loss_type, pred, target, loss_weight=1, train=True, key_name=None):
             loss = 0
@@ -183,69 +194,106 @@ class CMFramework(DefaultModel):
                 loss_dict[f"eval/{key_name if key_name is not None else loss_type}"] = loss
             return loss, loss_dict
 
-
-
-        def joint_training_loss_fn(update_params, total_states_dict, args, has_aux=False):
+        def joint_training_loss_fn(update_params, total_states_dict, args):
             # Set loss dict and total loss
             loss_dict = {}
             total_loss = 0
 
             torso_params = update_params['torso_state']
             head_params = update_params['head_state']
-            target_model = jax.lax.stop_gradient(torso_params) 
+            target_model = jax.lax.stop_gradient(torso_params)
 
             # Unzip arguments for loss_fn
-            y, rng_key = args
-            
-            rng_key, step_key, noise_key, dropout_key = jax.random.split(rng_key, 4)
-            noise = jax.random.normal(noise_key, y.shape)
+            y, z, dropout_key = args
+
+            step_key, noise_key = jax.random.split(dropout_key, 2)
             
             # Sigma sampling
             current_step = jnp.floor(total_states_dict['torso_state'].opt_state.gradient_step).astype(int)
             sigma, prev_sigma = get_sigma_sampling(diffusion_framework['sigma_sampling_joint'], step_key, y, current_step)
+            noise = jax.random.normal(noise_key, y.shape)
             perturbed_x = y + sigma * noise
             prev_perturbed_x = y + prev_sigma * noise
 
-            # Get consistency function values
-            cm_dropout_key, dropout_key = jax.random.split(dropout_key, 2)
-          
-            def discrete_loss(torso_params, target_model, y, sigma, prev_sigma, perturbed_x, prev_perturbed_x, dropout_key):
-                D_x, aux = self.model.apply(
-                    {'params': torso_params}, x=perturbed_x, sigma=sigma,
-                    train=True, augment_labels=None, rngs={'dropout': dropout_key})
-                
-                prev_D_x, _ = self.model.apply(
-                    {'params': target_model}, x=prev_perturbed_x, sigma=prev_sigma,
-                    train=True, augment_labels=None, rngs={'dropout': dropout_key})
-                # Get consistency loss
-                loss_weight = 1 / (sigma - prev_sigma)
-                consistency_loss, consistency_loss_dict = get_loss(diffusion_framework['loss'], D_x, prev_D_x, loss_weight=loss_weight, train=True)
-                return consistency_loss, consistency_loss_dict, (D_x, aux)
-
-            consistency_loss, consistency_loss_dict, func_val = discrete_loss(torso_params, target_model, y, sigma, prev_sigma, perturbed_x, prev_perturbed_x, cm_dropout_key)
-            total_loss += consistency_loss
-            loss_dict.update(consistency_loss_dict)
+            # Get consistency function values          
+            D_x, _ = self.model.apply(
+                {'params': torso_params}, x=perturbed_x, sigma=sigma,
+                train=False, augment_labels=None, rngs={'dropout': dropout_key})
             
-            D_x, aux = func_val
-            head_D_x = jax.lax.stop_gradient(D_x)
-            head_t_emb, head_last_x_emb = jax.lax.stop_gradient(aux) if not diffusion_framework['gradient_flow_from_head'] else aux
+            prev_D_x, _ = self.model.apply(
+                {'params': target_model}, x=prev_perturbed_x, sigma=prev_sigma,
+                train=False, augment_labels=None, rngs={'dropout': dropout_key})
 
-            denoised, aux = self.head.apply(
-                {'params': head_params}, x=perturbed_x, sigma=sigma, 
-                F_x=head_D_x, t_emb=head_t_emb, last_x_emb=head_last_x_emb,
-                train=True, augment_labels=None, rngs={'dropout': dropout_key})
-
-            # Get DSM
-            sigma_data = 0.5
-            weight = (sigma ** 2 + sigma_data ** 2) / ((sigma * sigma_data) ** 2)
-            joint_training_weight = diffusion_framework.get('joint_training_weight', 1)
-            dsm_loss = jnp.mean(joint_training_weight * weight * (denoised - y) ** 2)
-            total_loss += dsm_loss
-            loss_dict['train/head_dsm_loss'] = dsm_loss
-
-
+            new_D_x, _ = self.model.apply(
+                    {'params': torso_params}, x=z, sigma=self.sigma_max,
+                    train=False, augment_labels=None, rngs={'dropout': dropout_key})
+            
+            consistency_loss, consistency_loss_dict = get_loss(diffusion_framework['loss'], new_D_x, y, loss_weight=1, train=True)
+            original_loss, _ = get_loss(diffusion_framework['loss'], D_x, prev_D_x, loss_weight=1, train=True)
+            total_loss += consistency_loss + original_loss
+            loss_dict.update(consistency_loss_dict)
             return total_loss, loss_dict
 
+        # def joint_training_loss_fn(update_params, total_states_dict, args, has_aux=False):
+        #     # Set loss dict and total loss
+        #     loss_dict = {}
+        #     total_loss = 0
+
+        #     torso_params = update_params['torso_state']
+        #     head_params = update_params['head_state']
+        #     target_model = jax.lax.stop_gradient(torso_params) 
+
+        #     # Unzip arguments for loss_fn
+        #     y, rng_key = args
+            
+        #     rng_key, step_key, noise_key, dropout_key = jax.random.split(rng_key, 4)
+        #     noise = jax.random.normal(noise_key, y.shape)
+            
+        #     # Sigma sampling
+        #     current_step = jnp.floor(total_states_dict['torso_state'].opt_state.gradient_step).astype(int)
+        #     sigma, prev_sigma = get_sigma_sampling(diffusion_framework['sigma_sampling_joint'], step_key, y, current_step)
+        #     perturbed_x = y + sigma * noise
+        #     prev_perturbed_x = y + prev_sigma * noise
+
+        #     # Get consistency function values
+        #     cm_dropout_key, dropout_key = jax.random.split(dropout_key, 2)
+          
+        #     def discrete_loss(torso_params, target_model, y, sigma, prev_sigma, perturbed_x, prev_perturbed_x, dropout_key):
+        #         D_x, aux = self.model.apply(
+        #             {'params': torso_params}, x=perturbed_x, sigma=sigma,
+        #             train=True, augment_labels=None, rngs={'dropout': dropout_key})
+                
+        #         prev_D_x, _ = self.model.apply(
+        #             {'params': target_model}, x=prev_perturbed_x, sigma=prev_sigma,
+        #             train=True, augment_labels=None, rngs={'dropout': dropout_key})
+        #         # Get consistency loss
+        #         loss_weight = 1 / (sigma - prev_sigma)
+        #         consistency_loss, consistency_loss_dict = get_loss(diffusion_framework['loss'], D_x, prev_D_x, loss_weight=loss_weight, train=True)
+        #         return consistency_loss, consistency_loss_dict, (D_x, aux)
+
+        #     consistency_loss, consistency_loss_dict, func_val = discrete_loss(torso_params, target_model, y, sigma, prev_sigma, perturbed_x, prev_perturbed_x, cm_dropout_key)
+        #     total_loss += consistency_loss
+        #     loss_dict.update(consistency_loss_dict)
+            
+        #     D_x, aux = func_val
+        #     head_D_x = jax.lax.stop_gradient(D_x)
+        #     head_t_emb, head_last_x_emb = jax.lax.stop_gradient(aux) if not diffusion_framework['gradient_flow_from_head'] else aux
+
+        #     # denoised, aux = self.head.apply(
+        #     #     {'params': head_params}, x=perturbed_x, sigma=sigma, 
+        #     #     F_x=head_D_x, t_emb=head_t_emb, last_x_emb=head_last_x_emb,
+        #     #     train=True, augment_labels=None, rngs={'dropout': dropout_key})
+
+        #     # # Get DSM
+        #     # sigma_data = 0.5
+        #     # weight = (sigma ** 2 + sigma_data ** 2) / ((sigma * sigma_data) ** 2)
+        #     # joint_training_weight = diffusion_framework.get('joint_training_weight', 1)
+        #     # dsm_loss = jnp.mean(joint_training_weight * weight * (denoised - y) ** 2)
+        #     # total_loss += dsm_loss
+        #     # loss_dict['train/head_dsm_loss'] = dsm_loss
+
+
+        #     return total_loss, loss_dict
 
         def update_params_fn(
                 states_dict: dict, 
@@ -280,15 +328,13 @@ class CMFramework(DefaultModel):
             
 
         # Define update function
-        def update(carry_state, x0):
+        def update(carry_state, data):
             (rng, states) = carry_state
-            rng, new_rng = jax.random.split(rng)
-
+            (x0, z) = data
             loss_dict = {}
             
             head_torso_key = ["head_state", "torso_state"]
-            rng, head_torso_rng = jax.random.split(rng)
-            states, loss_dict = update_params_fn(states, head_torso_key, joint_training_loss_fn, (x0, head_torso_rng), loss_dict)
+            states, loss_dict = update_params_fn(states, head_torso_key, joint_training_loss_fn, (x0, z, rng), loss_dict)
 
             for loss_key in loss_dict:
                 loss_dict[loss_key] = jax.lax.pmean(loss_dict[loss_key], axis_name=self.pmap_axis)
@@ -302,9 +348,7 @@ class CMFramework(DefaultModel):
                 is_updated,
                 ema_update_fn, lambda x, step: x, states, states[head_torso_key[0]].opt_state.gradient_step)
             
-
-            new_carry_state = (new_rng, states)
-            return new_carry_state, loss_dict
+            return (rng, states), loss_dict
 
 
         # Define p_sample_jit functions for sampling
@@ -364,6 +408,7 @@ class CMFramework(DefaultModel):
                 {'params': params}, x=x_cur, sigma=t_cur, 
                 train=False, augment_labels=None, rngs={'dropout': dropout_key})
             return denoised
+        self.sample_cm_fn = sample_cm_fn
 
         self.p_sample_edm = jax.pmap(sample_edm_fn)
         self.p_sample_cm = jax.pmap(sample_cm_fn)
@@ -415,26 +460,81 @@ class CMFramework(DefaultModel):
             "diffusion": flax.jax_utils.unreplicate(self.training_states['torso_state']), 
             "head": flax.jax_utils.unreplicate(self.training_states['head_state'])
         }
-    
+
     def fit(self, x0, cond=None, step=0):
         key, dropout_key = jax.random.split(self.rand_key, 2)
         self.rand_key = key
 
+        data = jnp.asarray(x0)
+        x0 = data[:, :, :, 0, :, :, :].squeeze()
+        new_z = data[:, :, :, 1, :, :, :].squeeze()
+        
+
         # Apply pmap
-        dropout_key = jax.random.split(dropout_key, jax.local_device_count())
-        dropout_key = jnp.asarray(dropout_key)
-        x0 = jnp.asarray(x0)
-        new_carry, loss_dict_stack = self.update_fn((dropout_key, self.training_states), x0)
-        (_, training_states) = new_carry
+        carry_state = (jnp.asarray([dropout_key]*jax.local_device_count()), self.training_states)
+        carry_state, loss_dict_stack = self.update_fn(carry_state, (x0, new_z))
+        _, training_states = carry_state
 
         loss_dict = jax.tree_util.tree_map(lambda x: jnp.mean(x), loss_dict_stack)
         self.training_states = training_states
-
 
         return_dict = {}
         return_dict.update(loss_dict)
         self.wandblog.update_log(return_dict)
         return return_dict
+    
+    # def fit(self, x0, cond=None, step=0):
+    #     key, dropout_key = jax.random.split(self.rand_key, 2)
+    #     self.rand_key = key
+
+    #     x0 = jnp.asarray(x0)
+    #     y = jnp.reshape(x0, (-1, *x0.shape[-3:]))
+        
+    #     @jax.jit
+    #     def cm_forward(z):
+    #         D_x, _ = self.model.apply(
+    #             {'params': flax.jax_utils.unreplicate(self.training_states['torso_state']).params},
+    #             x=z, sigma=self.sigma_max,
+    #             train=False, augment_labels=None, rngs={'dropout': dropout_key})
+    #         return D_x
+        
+    #     @jax.jit
+    #     def obj_func(z):
+    #         D_x = cm_forward(z)
+    #         # z_norm = jnp.linalg.norm(z)
+    #         return self.pseudo_huber_loss_fn(D_x, y)
+    #             # - (data_dim - 1) * jnp.log(z_norm / t_max) + z_norm**2 / t_max**2 / 2
+        
+    #     z = jax.random.normal(key, y.shape) * self.sigma_max
+        
+    #     solver = jaxopt.ScipyMinimize(method = "l-bfgs-b", fun=obj_func, tol = 1e-12, maxiter = 1e+6)
+    #     # solver = jaxopt.LBFGS(fun=obj_func, tol = 1e-12, maxiter = 1e+6)
+    #     sol = solver.run(z)
+    #     new_z = sol.params
+    #     # new_z = jnp.reshape(new_z, x0.shape)
+        
+    #     if self.total_num <= self.current_num:
+    #         exit()
+        
+    #     # samples = cm_forward(new_z)
+        
+    #     self.fs_utils.save_noise_to_dir(new_z, starting_pos=self.current_num)
+    #     self.fs_utils.save_images_to_dir(y, starting_pos=self.current_num)
+    #     self.current_num += new_z.shape[0]
+
+    #     # # Apply pmap
+    #     # carry_state = (jnp.asarray([dropout_key]*jax.local_device_count()), self.training_states)
+    #     # carry_state, loss_dict_stack = self.update_fn(carry_state, (x0, new_z))
+    #     # _, training_states = carry_state
+
+
+    #     # loss_dict = jax.tree_util.tree_map(lambda x: jnp.mean(x), loss_dict_stack)
+    #     # self.training_states = training_states
+
+    #     # return_dict = {}
+    #     # return_dict.update(loss_dict)
+    #     # self.wandblog.update_log(return_dict)
+    #     # return return_dict
 
     def sampling_edm(self, num_image, img_size=(32, 32, 3), original_data=None, mode="edm", random_key=None):
         # Multistep sampling using the distilled score
@@ -606,7 +706,80 @@ class CMFramework(DefaultModel):
         latent_sample = self.p_sample_cm(sampling_params, latent_sample, rng_key, gamma, current_t, t_min)
         latent_sample = latent_sample.reshape(num_image, *img_size)
         return latent_sample
-    
+
+    def new_idea(self, num_image, img_size=(32, 32, 3), original_data=None, random_key=None):
+        # z_tuple = (jax.local_device_count(), num_image // jax.local_device_count(), *img_size)
+        z_tuple = (num_image, *img_size)
+        
+        if random_key is None:
+            self.rand_key, sampling_key = jax.random.split(self.rand_key, 2)
+        else:
+            sampling_key = random_key
+        sampling_key, iterating_key = jax.random.split(sampling_key, 2)
+
+        # One-step generation
+        z = jax.random.normal(sampling_key, z_tuple) * self.sigma_max
+        new_z_list = []
+        for _ in range(4):
+            iterating_key, _ = jax.random.split(iterating_key, 2)
+            new_z = jax.random.normal(iterating_key, z_tuple) * self.sigma_max
+            new_z_list.append(new_z)
+        
+        rng_key, iterating_key = jax.random.split(iterating_key, 2)
+        # rng_key = jax.random.split(rng_key, jax.local_device_count())
+        # gamma = jnp.asarray([0] * jax.local_device_count())
+        # t_max = jnp.asarray([self.sigma_max] * jax.local_device_count())
+        # t_min = jnp.asarray([self.sigma_min] * jax.local_device_count())
+        gamma = 0
+        t_max = self.sigma_max
+        t_min = self.sigma_min
+
+        # sampling_params = flax.jax_utils.replicate(self.torso_state.params_ema)
+        sampling_params = self.torso_state.params_ema
+
+        @jax.jit
+        def cm_forward(z):
+            return partial(self.sample_cm_fn, params=sampling_params, rng_key=rng_key, gamma=gamma, t_cur=t_max, t_prev=t_min)(x_cur=z)
+
+        @jax.jit
+        def cm_forward_jvp(z, tan):
+            _, tan_out = jax.jvp(cm_forward, (z,), (tan,))
+            return tan_out
+
+        @jax.jit
+        def pseudohuber_grad(pred, target):
+            return jax.grad(partial(self.pseudo_huber_loss_fn, target=target, loss_weight=1))(pred)
+
+        @jax.jit
+        def lpips_grad(pred, target):
+            return jax.grad(partial(self.lpips_loss_fn, target=target, loss_weight=1))(pred)
+
+        x0 = cm_forward(z)
+        # data_dim = x0.shape[0]*x0.shape[1]*x0.shape[2]*x0.shape[3]
+        def obj_func(z):
+            # z_norm = jnp.linalg.norm(z)
+            return self.pseudo_huber_loss_fn(cm_forward(z), x0)
+                # - (data_dim - 1) * jnp.log(z_norm / t_max) + z_norm**2 / t_max**2 / 2
+        new_x0_list = []
+        for new_z in new_z_list:
+            print('Optimizing...')
+            solver = jaxopt.ScipyMinimize(method = "l-bfgs-b", fun=obj_func, tol = 1e-12, maxiter = 1e+6)
+            sol = solver.run(new_z)
+            print('Done')
+            print(f'Distance between x0 and new_x0: {self.pseudo_huber_loss_fn(x0, cm_forward(sol.params))}')    
+            
+            new_x0 = cm_forward(sol.params)
+            print(f'Initial distance between z and new_z: {self.pseudo_huber_loss_fn(z, new_z)}')            
+            print(f'Terminal distance between z and new_z: {self.pseudo_huber_loss_fn(z, sol.params)}')
+            new_x0_list.append(new_x0)
+        
+        new_z_mean = jnp.mean(jnp.stack(new_z_list), axis=0)
+        new_x0_mean = cm_forward(new_z_mean)
+        print(self.pseudo_huber_loss_fn(x0, new_x0_mean))
+        print(self.pseudo_huber_loss_fn(z, new_z_mean))
+        
+        return x0, new_x0_list
+
     def sampling(self, num_image, img_size=(32, 32, 3), original_data=None, mode="edm", random_key=None):
         # mode option: edm, cm_training, cm_not_training
         if mode == "edm":
@@ -617,3 +790,5 @@ class CMFramework(DefaultModel):
             return self.sampling_cm(num_image, img_size, original_data, mode, random_key)
         elif "two-step" in mode:
             return self.sampling_cm_two_step(num_image, img_size, original_data, mode, random_key)
+    # def sampling(self, num_image, img_size=(32, 32, 3), original_data=None, mode="edm", random_key=None):
+    #     return self.new_idea(num_image, img_size, original_data, random_key)
